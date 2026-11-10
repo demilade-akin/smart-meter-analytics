@@ -1,0 +1,459 @@
+% =============================================================================
+%  Phase 3: EDA & Feature Engineering
+%  Rubric: docs/spec/phase3_details.pdf (no page limit; "concise").
+%  Source of every number: notebooks/feature_engineering.ipynb (executed outputs).
+%  Figures: reports/figures/p3_*.png, written by that notebook.
+%  Lines marked "% CHECK:" are review notes for the authors, not report text.
+%  Build: latexmk -pdf -outdir=build main.tex
+% =============================================================================
+\documentclass[11pt,letterpaper]{article}
+\input{../_template/preamble}
+\addbibresource{references.bib}
+
+% ---- Metadata ---------------------------------------------------------------
+\projecttitle[Bill Forecasting]{Forecasting Household Month End Electricity Bills from Smart Meter Data}
+\phaselabel{Phase 3 \textperiodcentered{} EDA \& Feature Engineering}
+\authors{Akinbobola Akin (3784664), Adejuwon Oluwasegun Isaac (3806766), Edehi Andrew Igue (3778767)}
+\course{TME6014 -- Data Analytics}
+\reportdate{November 10, 2026}
+% CHECK: set to the actual submission date.
+
+\begin{document}
+\maketitleblock
+
+% =============================================================================
+\section{Introduction and Scope}
+\label{sec:intro}
+
+Predicting a household's electricity bill before the billing month ends lets the household react while
+there is still time to change its usage. This phase explores the cleaned smart meter data from Phase~2 and
+builds the modelling dataset for Phase~4. It returns to the research question set in Phase~1:
+
+\begin{quote}
+\textbf{On day $d$ of a billing month, how accurately can a household's month-end bill be projected, with a
+prediction interval, from its smart meter readings?}
+\end{quote}
+
+On day $d$ the kWh used on days $1..d$ is already known. The model only has to predict the kWh for days
+$d{+}1$ to the end of the month and add it to the known part. Three candidate values, $d \in \{7, 14, 21\}$,
+are carried forward; Phase~4 chooses the final one.
+
+\paragraph{Bill proxy} The bill is a \emph{computed proxy}, not a real invoice: kWh $\times$ \pounds 0.14228
+per kWh, the published standard tariff~\cite{datastore_smartmeters}. Because the bill is kWh times a fixed
+rate, every correlation ``with the bill'' in this report is identical to the correlation with kWh.
+
+\paragraph{Scope} The analysis covers \textbf{standard-tariff (Std) households only}. Time-of-use households
+paid different prices by time of day during 2013, so the flat-rate proxy misstates their bills; they are kept
+for the stretch goal. The filter is applied before any statistic is computed. No household changes tariff
+during the trial, so whole histories are kept or dropped (Table~\ref{tab:scope}).
+
+\begin{table}[!ht]
+  \centering
+  \caption{Data used in this phase (Phase~2 outputs~\cite{kaggle_smartmeters}, December 2011 to January 2014).}
+  \label{tab:scope}
+  \small
+  % Y{f} widths sum to 1 (one Y column).
+  \begin{tabularx}{\linewidth}{Y{1} r r r}
+    \tableheadrow
+    \colhead{Level} & \colhead{All tariffs} & \colhead{Std only} & \colhead{Kept} \\
+    \tableheadend
+    Households & 5,548 & 4,428 & 79.8\% \\
+    Household-months (\code{monthly.parquet}) & 106,225 & 84,807 & 79.8\% \\
+    Household-days (\code{daily.parquet}) & 3,239,805 & 2,586,554 & 79.8\% \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+Every number and figure in this report comes from the notebook \code{feature\_\allowbreak engineering.ipynb}. It reads
+the Phase~2 Parquet files with DuckDB and saves the modelling dataset as \code{features\_\allowbreak day\_d.parquet}
+in \code{data/processed/}.
+
+% =============================================================================
+\section{Exploratory Data Analysis}
+\label{sec:eda}
+
+\subsection{Descriptive Statistics}
+\label{sec:stats}
+
+Table~\ref{tab:stats} summarises the monthly and daily variables. No value is missing. Households have a
+median of 20 months of data (range 1 to 26), and 4,244 of the 4,428 have at least 12 months.
+
+\begin{table}[!ht]
+  \centering
+  \caption{Summary statistics, Std households. \code{filled\_slots} counts half hours that Phase~2 filled in,
+  out of about 1,460 per month.}
+  \label{tab:stats}
+  \small
+  \begin{tabularx}{\linewidth}{X r r r r r}
+    \tableheadrow
+    \colhead{Variable} & \colhead{Mean} & \colhead{Median} & \colhead{SD} & \colhead{Min} & \colhead{Max} \\
+    \tableheadend
+    Monthly kWh & 315.96 & 250.29 & 261.81 & 1.29 & 6,385.89 \\
+    Monthly bill (\pounds) & 44.95 & 35.61 & 37.25 & 0.18 & 908.58 \\
+    Monthly mean temperature (\textdegree C) & 11.01 & 10.96 & 5.04 & 3.80 & 20.04 \\
+    Filled half hours per month & 2.30 & 0 & 12.83 & 0 & 146 \\
+    Daily kWh & 10.36 & 7.96 & 9.35 & 0.001 & 332.56 \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+Consumption is strongly right-skewed (Figure~\ref{fig:hist}): the mean is well above the median and the largest
+month is about 25 times the median. Bills have exactly the same shape, since they are kWh times a constant.
+
+\begin{figure}[!ht]
+  \centering
+  \includegraphics[width=0.75\linewidth]{p3_monthly_kwh_hist.png}
+  \caption{Monthly kWh per household-month. The axis stops at the 99.5th percentile so the long tail does not
+  flatten the plot.}
+  \label{fig:hist}
+\end{figure}
+
+\subsection{Seasonality and Temperature}
+\label{sec:season}
+
+Consumption follows a clear yearly cycle that mirrors temperature (Figure~\ref{fig:trend}). Mean winter
+consumption is 379.49~kWh per household-month against 256.22~kWh in summer, 48.1\% higher (spring 323.74,
+autumn 308.92). Across the 26 calendar-month averages, temperature and kWh correlate at $r = -0.925$, but at
+the household-month level the correlation is only $-0.186$. Differences \emph{between} households (size,
+heating type, occupancy) are much larger than the seasonal swing \emph{within} a household. Temperature
+explains when a household uses more, not which household uses more.
+
+Two details matter for modelling. The first months of the trial hold few households (61 in December 2011),
+so their averages are noisy; from June 2012 every month has more than 2,800. And February 2013 dips below
+its neighbours even though it was colder than January, because February has only 28 days: monthly totals
+partly measure month length, which the day-$d$ features handle by working with daily means and day counts.
+
+\begin{figure}[!ht]
+  \centering
+  \includegraphics[width=0.82\linewidth]{p3_monthly_trend_temp.png}
+  \caption{Mean kWh per household (top) and mean temperature (bottom) for each calendar month. Two panels
+  rather than two y-axes, so neither scale exaggerates the relationship.}
+  \label{fig:trend}
+\end{figure}
+
+\subsection{Household Groups and History}
+\label{sec:groups}
+
+ACORN classifies neighbourhoods by income and lifestyle. Affluent households use the most and Adversity
+households the least (Table~\ref{tab:acorn}), but the distributions overlap heavily
+(Figure~\ref{fig:acorn}): the group shifts the typical level and leaves most of the variation unexplained.
+The Unknown group has only 37 households, so its high mean is unstable (its median is below Affluent's). These
+differences are descriptive and do not establish causal relationships.
+
+\begin{table}[!ht]
+  \centering
+  \caption{Monthly kWh by ACORN group, Std households.}
+  \label{tab:acorn}
+  \small
+  \begin{tabularx}{\linewidth}{X r r r r}
+    \tableheadrow
+    \colhead{ACORN group} & \colhead{Households} & \colhead{Household-months} & \colhead{Mean kWh} & \colhead{Median kWh} \\
+    \tableheadend
+    Affluent & 1,700 & 33,068 & 361.69 & 266.70 \\
+    Comfortable & 1,179 & 22,381 & 313.42 & 267.34 \\
+    Adversity & 1,512 & 28,692 & 263.86 & 224.09 \\
+    Unknown & 37 & 666 & 375.49 & 238.00 \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+\begin{figure}[!ht]
+  \centering
+  \includegraphics[width=0.82\linewidth]{p3_acorn_box.png}
+  \caption{Monthly kWh by ACORN group (box: middle 50\%; line: median; whiskers: 1.5 IQR; outliers hidden).}
+  \label{fig:acorn}
+\end{figure}
+
+A household's months are not always consecutive, because Phase~2 dropped incomplete months. Of 80,379 pairs
+of consecutive records, 240 (in 175 households) skip at least one month. Lag features must check that the
+earlier record is the exact calendar month required, or they silently use the wrong month.
+
+\subsection{Outliers}
+\label{sec:outliers}
+
+The first pass flagged months above a pooled Tukey fence ($Q_3 + 1.5\,\mathrm{IQR} = 736.19$~kWh). On Std
+households this flags 4,657 household-months (5.49\%) in 676 households. But 58.3\% of those flags belong to
+households whose \emph{median} month is already above the fence. The pooled check finds large households,
+not unusual months.
+
+To find unusual months we compare each month with the household's own history, using the robust z-score
+$0.6745\,(x - \tilde{x}_h)/\mathrm{MAD}_h$, where $\tilde{x}_h$ is the household's median monthly kWh and
+$\mathrm{MAD}_h$ its median absolute deviation. Median and MAD are not distorted by the outliers being sought.
+Months with $|z| > 3.5$ are flagged, for the 4,393 households with at least 6 months. Table~\ref{tab:outliers}
+compares the two checks.
+
+\begin{table}[!ht]
+  \centering
+  \caption{Pooled versus within-household outlier checks.}
+  \label{tab:outliers}
+  \small
+  % Y{f} widths sum to 1 (one Y column).
+  \begin{tabularx}{\linewidth}{Y{1} r r}
+    \tableheadrow
+    \colhead{Measure} & \colhead{Pooled IQR} & \colhead{Within household} \\
+    \tableheadend
+    Household-months flagged & 4,657 (5.49\%) & 1,731 (2.04\%) \\
+    Households with a flag & 676 & 932 \\
+    Flagged high / low & 4,657 / 0 & 1,303 / 428 \\
+    Months flagged by both checks & \multicolumn{2}{c}{274} \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+The two checks find mostly different months. Within-household high flags cluster in December (348) and
+January (324), consistent with a household switching on electric heating; low flags peak in August (78),
+consistent with a home left empty during the summer holidays. These are real readings, so they are kept:
+high consumption does not by itself indicate an error, and an alert system has to cope with exactly these
+months. They are also the months a forecast will miss most, which is why the forecast needs a prediction
+interval. The within-household check uses each household's full history, including later months, so it is a
+data check only and never a model input.
+
+\subsection{Daily Patterns}
+\label{sec:daily}
+
+The day-$d$ task is built from daily data, which the first pass did not use. To compare days across
+households, each day's kWh is divided by that household's mean day in the same month. Weekends run 3.5\%
+above that mean and normal weekdays 1.5\% below; Sunday is the highest day (+5.7\%) and bank holidays sit in
+between (+1.8\%). Daily kWh falls steadily as temperature rises and levels off above about 17\textdegree C,
+when there is no heating left to switch off (Figure~\ref{fig:daily}). The weekend and holiday effects are
+small but consistent, so the number of such days still to come in the month carries a little information about
+the remaining kWh.
+
+\begin{figure}[!ht]
+  \centering
+  \includegraphics[width=\linewidth]{p3_daily_patterns.png}
+  \caption{Left: daily kWh per household-day (to the 99.5th percentile). Centre: kWh by day of week relative to
+  the household-month mean (bank holidays excluded). Right: mean daily kWh by daily mean temperature.}
+  \label{fig:daily}
+\end{figure}
+
+\subsection{Month-to-Date Information and Benchmarks}
+\label{sec:benchmarks}
+
+Figure~\ref{fig:share} shows the share of the month's kWh already used by day $d$. The median follows the
+``every day equal'' line ($d$ divided by the days in the month) almost exactly: 22.8\%, 45.7\% and 68.6\% at
+$d = 7, 14, 21$, against 23.0\%, 45.9\% and 68.9\%. Scaling the month-to-date total up to a full month is
+therefore a sensible baseline. The spread is the difficulty: at $d = 14$ one household-month in ten has used
+less than 40.7\% of its total and one in ten more than 51.4\%. That spread is what the model must explain
+from history, calendar and weather.
+
+\begin{figure}[!ht]
+  \centering
+  \includegraphics[width=0.82\linewidth]{p3_share_by_day.png}
+  \caption{Share of the month's kWh used by day $d$: median household-month, 10th to 90th percentile band, and
+  the share if every day were equal. Dotted lines mark the candidate values of $d$.}
+  \label{fig:share}
+\end{figure}
+
+This gives the first benchmark from Phase~1, the \textbf{run-rate projection}
+(\code{kwh\_to\_date}~$/\,d~\times$~days in month). We compare it with the other two, \textbf{last month's bill}
+and \textbf{the same month last year}, using the median absolute percentage error of the projected month
+total and the mean absolute error in pounds. The median is used because a few near-empty months make
+percentage errors explode. Same-month-last-year values exist only from December 2012 (most households joined
+between April and July 2012), so all three are compared on the 32,491 household-months that have both a
+previous month and a same month last year (Table~\ref{tab:benchmarks}, Figure~\ref{fig:runrate}).
+
+\begin{table}[!ht]
+  \centering
+  \caption{Benchmark errors on the same 32,491 household-months.}
+  \label{tab:benchmarks}
+  \small
+  \begin{tabularx}{\linewidth}{X r r}
+    \tableheadrow
+    \colhead{Benchmark} & \colhead{Median abs.\ \% error} & \colhead{Mean abs.\ error (\pounds)} \\
+    \tableheadend
+    Run-rate projection, $d = 7$ & 6.8\% & 5.04 \\
+    Run-rate projection, $d = 14$ & 4.2\% & 3.23 \\
+    Run-rate projection, $d = 21$ & 2.5\% & 1.93 \\
+    Last month's bill & 9.3\% & 6.68 \\
+    Same month last year & 12.0\% & 8.46 \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+\begin{figure}[!ht]
+  \centering
+  \includegraphics[width=0.82\linewidth]{p3_runrate_error.png}
+  \caption{Median absolute percentage error of the projected month total by forecast day. The history-only
+  benchmarks do not use days $1..d$, so they are flat.}
+  \label{fig:runrate}
+\end{figure}
+
+The run-rate projection beats last month's bill from $d = 4$ and is less than half its error by $d = 14$.
+This is the bar a Phase~4 model has to clear: a model that cannot beat a straight-line projection of the month
+so far adds nothing. It also shows that the month-to-date total carries most of the signal, and that history
+and calendar features can add most at small $d$, where the run-rate projection is weakest.
+
+% =============================================================================
+\section{Key Insights and Implications for Phase 4}
+\label{sec:insights}
+
+Table~\ref{tab:insights} lists the main findings and the modelling decision each one leads to.
+
+\begin{table}[!ht]
+  \centering
+  \caption{Insights and how they guide the modelling phase.}
+  \label{tab:insights}
+  \small
+  % Y{f} widths sum to 2 (two Y columns).
+  \begin{tabularx}{\linewidth}{Y{1} Y{1}}
+    \tableheadrow
+    \colhead{Insight} & \colhead{Implication for Phase 4} \\
+    \tableheadend
+    The run-rate projection has a median error of 6.8\%, 4.2\% and 2.5\% at $d = 7, 14, 21$, well below last
+    month (9.3\%) and same month last year (12.0\%). &
+    Score every model against the run-rate projection at each $d$; a model is only useful if it beats it. \\
+    Month-to-date usage dominates; history features correlate almost as strongly with the remaining kWh at
+    $d = 7$ but fall behind by $d = 21$. &
+    Predict the \emph{remaining} kWh (days $d{+}1$..end) so the known part is never re-predicted; expect history
+    features to matter most at small $d$. \\
+    Pooled correlation of consecutive months is 0.928, but the median within-household correlation is 0.577
+    (4,366 households). &
+    Much of the pooled value is ``big households stay big''. Compare pooled and per-household models (the
+    secondary question) and report errors per household. \\
+    Winter consumption is 48.1\% above summer; calendar-month temperature correlates with kWh at $-0.925$. &
+    Keep a cyclical month encoding and temperature to date; expect them to overlap ($r = -0.89$). \\
+    Usage is right-skewed and 2.04\% of months are unusual for their own household. &
+    Use robust error measures (median, pounds), try a log target or robust scaling, and size the prediction
+    interval on these months. \\
+    Same-month-last-year exists for only 38.4\% of rows, all from December 2012 on. &
+    Use a time-based split with 2013 months in the test set; handle the missing lag explicitly. \\
+    Weekends run 3.5\% and bank holidays 1.8\% above the household's average day. &
+    Keep the remaining-weekend and remaining-holiday counts: weak, but known in advance and leak-free. \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+% =============================================================================
+\section{Feature Engineering}
+\label{sec:features}
+
+\subsection{The \texorpdfstring{Day-$d$}{Day-d} Dataset}
+\label{sec:dataset}
+
+The modelling table has \textbf{one row per household $\times$ month $\times$ $d$}, for $d \in \{7, 14, 21\}$:
+84,807 household-months $\times$ 3 = \textbf{254,421 rows}. One rule keeps it honest: \emph{a feature may use
+only days $1..d$ of the target month, or earlier months}. Days after $d$ appear only in the targets.
+Table~\ref{tab:features} lists the features.
+
+\begin{table}[!ht]
+  \centering
+  \caption{Selected features, with description and justification. ``MTD'' = month to date (days $1..d$).}
+  \label{tab:features}
+  \footnotesize
+  % Y{f} widths sum to 2 (two Y columns; the feature column is fixed width).
+  \begin{tabularx}{\linewidth}{>{\RaggedRight\arraybackslash}p{3.7cm} Y{0.85} Y{1.15}}
+    \tableheadrow
+    \colhead{Feature} & \colhead{Description} & \colhead{Justification} \\
+    \tableheadend
+    \multicolumn{3}{l}{\textit{Month to date}} \\
+    \code{kwh\_to\_date} & kWh used on days $1..d$ & Known part of the bill; $r = 0.98$ with the final bill at $d = 14$. \\
+    \code{daily\_mean\_to\_date} & Mean daily kWh, days $1..d$ & Usage level independent of $d$ and month length. \\
+    \code{last7\_mean\_kwh} & Mean daily kWh, days $d{-}6..d$ & Picks up a change in usage partway through the month; strongest single correlate of the remaining kWh at $d = 21$ ($r = 0.94$). Same as the MTD mean at $d = 7$. \\
+    \code{run\_rate\_kwh} & \code{kwh\_to\_date}~$/\,d~\times$ days in month & Naive full-month projection; the benchmark the model must beat. \\
+    \code{days\_elapsed}, \code{days\_remaining} & $d$, and days in month $- d$ & Scale the remaining kWh; account for 28 to 31-day months. \\
+    \multicolumn{3}{l}{\textit{Earlier months}} \\
+    \code{previous\_month\_kwh} & kWh in the previous calendar month (NULL after a gap) & Recent household level; most informative at small $d$. \\
+    \code{rolling\_3month\_kwh} & Mean kWh of the three previous calendar months & Smoother level, less affected by one unusual month. \\
+    \code{same\_month\_last\_year\_kwh} & kWh in the same month a year earlier & Captures the household's own seasonal pattern; available from December 2012. \\
+    \multicolumn{3}{l}{\textit{Calendar (known in advance)}} \\
+    \code{month\_sin}, \code{month\_cos} & Month on a circle: $\sin$ and $\cos$ of $2\pi(m-1)/12$ & Seasonality with December next to January; replaces month number, quarter and season dummies. \\
+    \code{weekend\_days\_remaining} & Saturdays and Sundays after day $d$ & Weekend days use 3.5\% more than average. \\
+    \code{holidays\_remaining} & Bank holidays after day $d$ & Holidays use 1.8\% more than average. \\
+    \multicolumn{3}{l}{\textit{Weather and household}} \\
+    \code{temp\_mean\_to\_date} & Mean daily temperature, days $1..d$ & Heating demand. Full-month temperature would leak days after $d$. \\
+    \code{acorn\_comfortable}, \code{acorn\_adversity}, \code{acorn\_unknown} & ACORN group, one-hot, Affluent as the reference & Household level, useful when history is short. One group is dropped so the dummies do not sum to 1. \\
+    \multicolumn{3}{l}{\textit{Targets and benchmarks (not inputs)}} \\
+    \code{remaining\_kwh} & kWh on days $d{+}1$..end & Model target. \\
+    \code{month\_kwh}, \code{final\_bill\_gbp} & Month total; total $\times$ \pounds 0.14228 & Final bill = \code{kwh\_to\_date} + predicted \code{remaining\_kwh}, times the tariff. \\
+    \code{runrate\_bill\_gbp}, \code{last\_month\_bill\_gbp}, \code{same\_month\_ly\_bill\_gbp} & The three Phase~1 benchmarks as bills & Let Phase~4 score the benchmarks directly. \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+\subsection{Feature Availability}
+\label{sec:availability}
+
+Only the earlier-month features can be missing (Table~\ref{tab:availability}); all other columns are complete.
+Missing lags are left as NULL rather than filled in, because filling them with, for example, the household mean
+would use months after the target month. Phase~4 handles them either with models that accept missing values
+(gradient-boosted trees) or with a missing-value indicator for linear models.
+
+\begin{table}[!ht]
+  \centering
+  \caption{Availability of the earlier-month features (identical for every $d$; 84,807 household-months).}
+  \label{tab:availability}
+  \small
+  \begin{tabularx}{\linewidth}{X r r r}
+    \tableheadrow
+    \colhead{Feature} & \colhead{Available} & \colhead{Missing} & \colhead{Available (\%)} \\
+    \tableheadend
+    \code{previous\_month\_kwh} & 80,139 & 4,668 & 94.50 \\
+    \code{rolling\_3month\_kwh} & 71,002 & 13,805 & 83.72 \\
+    \code{same\_month\_last\_year\_kwh} & 32,588 & 52,219 & 38.43 \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+\subsection{Relationships Among Features}
+\label{sec:corr}
+
+Figure~\ref{fig:corr} shows the correlations at $d = 14$. The four month-to-date features are nearly the same
+signal ($r \geq 0.99$ with each other), so a linear model should keep one of them or use regularisation; tree
+models are not harmed by the redundancy. For the remaining kWh, \code{previous\_month\_kwh} correlates at 0.910,
+0.889 and 0.866 at $d = 7, 14, 21$, while \code{last7\_mean\_kwh} rises from 0.927 to 0.940: history matters
+most early in the month. The month cosine and temperature to date both measure winter ($r = -0.89$). The weekend
+and holiday counts are weak on their own ($|r| < 0.1$).
+
+\begin{figure}[!ht]
+  \centering
+  \includegraphics[width=0.92\linewidth]{p3_feature_corr.png}
+  \caption{Pearson correlations of the day-$d$ features and targets at $d = 14$ (pairwise on rows where both
+  values exist).}
+  \label{fig:corr}
+\end{figure}
+
+\subsection{Encoding and Scaling}
+\label{sec:scaling}
+
+ACORN group is one-hot encoded with Affluent, the largest group, as the reference; the month is encoded as a
+sine/cosine pair; the tariff indicator from Phase~2 is dropped because every row is Std. Features sit on very
+different ranges (\code{kwh\_to\_date} up to 3,741~kWh, the month encodings between $-1$ and 1), so scale-sensitive
+models need scaling. Scaling is \textbf{deferred to Phase~4} and will be fitted on the training period only, so
+the test months cannot influence it. Given the skew and outliers in Section~\ref{sec:outliers}, a robust scaler
+(median and IQR) or a log transform of the kWh columns is worth testing.
+
+\subsection{Changes from the First Pass and Validation}
+\label{sec:validation}
+
+The first pass predicted next month's bill from previous months. The changes made to realign it with the
+Phase~1 day-$d$ task are:
+\begin{itemize}[nosep]
+  \item Std households only, filtered before any statistic or lag.
+  \item New month-to-date features from the daily data, and a 12-month lag for the third benchmark.
+  \item Month number, quarter and four season dummies replaced by one sine/cosine pair; one ACORN dummy dropped.
+  \item Full-month temperature replaced by temperature to date, which does not leak future days.
+  \item Pooled IQR outliers reinterpreted, and a within-household check added.
+\end{itemize}
+
+The notebook ends with automatic checks that stop it if any fails. All pass: no duplicate household $\times$
+month $\times$ $d$ rows; the row count equals household-months $\times$ 3; \code{kwh\_to\_date} +
+\code{remaining\_kwh} equals the month total for every row; the final bill equals the Phase~2 monthly bill; every
+lag points to the correct calendar month. To test for leakage, every month-to-date feature was rebuilt from a copy
+of the daily data cut off at day $d$, and all values match. One household-month was also recomputed by hand from
+its daily rows at each $d$.
+
+% =============================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+
+The Std households show strongly skewed, seasonal, temperature-driven consumption, with much larger differences
+between households than within them. The daily data shows that by mid-month the naive run-rate projection already has a median error of 4.2\% on the month total, far better than the history-only benchmarks. The
+modelling dataset (\code{features\_day\_d.parquet}, 254,421 rows) contains month-to-date, history, calendar,
+weather and household features that use only information available on day $d$, plus the targets and all three
+benchmarks. Phase~4 will model the remaining kWh, choose $d$, compare pooled and per-household models against the
+run-rate projection, and fit scaling and prediction intervals on the training period only.
+
+\printbibliography[title={References}]
+
+\end{document}
