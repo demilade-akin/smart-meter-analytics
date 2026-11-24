@@ -1,0 +1,542 @@
+% =============================================================================
+%  Phase 4: Modeling & Analysis
+%  Rubric: docs/spec/phase4_details.pdf (no page limit).
+%  Source of every number: notebooks/modeling.ipynb (executed outputs).
+%  Figures: reports/figures/p4_*.png, written by that notebook.
+%  Lines marked "% CHECK:" are review notes for the authors, not report text.
+%  Build: latexmk -pdf -outdir=build main.tex
+% =============================================================================
+\documentclass[11pt,letterpaper]{article}
+\input{../_template/preamble}
+\addbibresource{references.bib}
+
+% ---- Metadata ---------------------------------------------------------------
+\projecttitle[Bill Forecasting]{Forecasting Household Month End Electricity Bills from Smart Meter Data}
+\phaselabel{Phase 4 \textperiodcentered{} Modeling \& Analysis}
+\authors{Akinbobola Akin (3784664), Adejuwon Oluwasegun Isaac (3806766), Edehi Andrew Igue (3778767)}
+\course{TME6014 -- Data Analytics}
+\reportdate{November 24, 2026}
+% CHECK: set to the actual submission date.
+
+\begin{document}
+\maketitleblock
+
+% =============================================================================
+\section{Introduction and Scope}
+\label{sec:intro}
+
+This phase builds and evaluates the models that answer the research question set in Phase~1:
+
+\begin{quote}
+\textbf{On day $d$ of a billing month, how accurately can a household's month-end bill be projected, with a
+prediction interval, from its smart meter readings? And when should the household be alerted?}
+\end{quote}
+
+The task is \textbf{regression}. On day $d$ the kWh used on days $1..d$ is already on the meter, so every model
+predicts only the remaining kWh (days $d{+}1$ to month end) and adds it to the known part. The bill is a
+\emph{computed proxy}, not a real invoice: kWh $\times$ \pounds 0.14228, the published standard
+tariff~\cite{datastore_smartmeters}, with no standing charge. As decided in Phase~3, only standard-tariff (Std)
+households are modelled.
+
+The input is the Phase~3 modelling dataset \code{features\_\allowbreak day\_d.parquet}: 254,421 rows (one per
+household $\times$ month $\times$ $d$, with $d \in \{7, 14, 21\}$) from 4,428 households, December 2011 to January
+2014~\cite{kaggle_smartmeters}. Every number and figure in this report comes from the notebook
+\code{notebooks/modeling.ipynb} (Section~\ref{sec:code}).
+
+% =============================================================================
+\section{Data Splitting}
+\label{sec:split}
+
+The data are a time series, so a random split would let a model learn from months that come after the ones it is
+scored on. The split is therefore \textbf{by calendar month}. Every row of a household-month (its three $d$
+values) always lands in the same part, so the model never sees the same month at another $d$. All choices
+(features, hyperparameters, interval method, alert rule) are made on three expanding-window validation folds. The
+last four months are a test set, used once, in Section~\ref{sec:test} (Table~\ref{tab:split}).
+
+\begin{table}[!ht]
+  \centering
+  \caption{Time-based split. Each fold trains on every month before its validation window. Lag availability
+  is the share of rows where the feature exists.}
+  \label{tab:split}
+  \small
+  \begin{tabularx}{\linewidth}{L l r r r r}
+    \tableheadrow
+    \colhead{Part} & \colhead{Evaluated on} & \colhead{Training rows} & \colhead{Evaluated rows} &
+    \colhead{Has last month} & \colhead{Has same month LY} \\
+    \tableheadend
+    Fold 1 & Jan--Mar 2013 & 92,247 & 38,676 & 99.6\% & 11.6\% \\
+    Fold 2 & Apr--Jun 2013 & 130,923 & 37,983 & 99.7\% & 42.0\% \\
+    Fold 3 & Jul--Sep 2013 & 168,906 & 37,194 & 99.7\% & 81.7\% \\
+    Test & Oct 2013--Jan 2014 & 206,100 & 48,321 & 99.6\% & 96.7\% \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+Most households joined in mid-2012, so ``same month last year'' exists for only 0.2\% of the rows that train
+fold~1, but for 96.7\% of test rows. Preprocessing (imputation, scaling) sits inside a scikit-learn
+pipeline~\cite{sklearn}, so it is fitted on each fold's training months only. The gradient boosting model's
+built-in early stopping is switched off, because it holds out a \emph{random} 10\% of rows, which would break the
+time split.
+
+% =============================================================================
+\section{Models Tested}
+\label{sec:models}
+
+\subsection{Benchmarks}
+The three benchmarks promised in Phase~1 need no training:
+\begin{itemize}
+  \item \textbf{Run-rate}: to-date daily mean $\times$ days in the month.
+  \item \textbf{Last month}: the previous month's full bill.
+  \item \textbf{Same month last year}: that month's bill one year earlier.
+\end{itemize}
+A fallback \textbf{chain} (same month last year, else last month, else run-rate) gives every row a forecast.
+
+\subsection{Candidate models}
+\begin{itemize}
+  \item \textbf{Ridge regression}, the interpretable linear reference. Missing lags are imputed with the median,
+  with indicator columns, and features are standardised. \emph{Strength:} simple, fast, and its coefficients can
+  be read. \emph{Weakness:} it cannot represent interactions such as ``early in the month and a large household''
+  without hand-made terms, and it fits the mean, so a few very large homes pull it around.
+  \item \textbf{Histogram gradient boosting} (scikit-learn's \code{HistGradientBoostingRegressor}, in the style of
+  LightGBM~\cite{ke2017lightgbm}). \emph{Strength:} it learns non-linear effects and interactions, handles missing
+  lags natively, trains in seconds on 250,000 rows, and supports absolute-error and quantile losses.
+  \emph{Weakness:} less transparent (we use permutation importance to explain it), and it can overfit calendar
+  features when history is short (Section~\ref{sec:features}).
+  \item \textbf{Per-household model}, for the secondary question (pooled versus per-household). A regression per
+  household is not realistic: a household has a median of about 20 months, so about 20 rows per $d$. Instead, each
+  household's own average correction at the same $d$ over its \emph{earlier} months is shrunk toward the run-rate
+  with weight $k/(n+k)$, where $n$ is the number of earlier months. $k = 0$ trusts the household's history fully,
+  and a large $k$ falls back to the run-rate.
+\end{itemize}
+
+\subsection{Target transformation}
+\label{sec:target}
+Errors grow with household size: a 5\% miss is about \pounds 1 for a small home and \pounds 10 for a large one.
+Besides the raw target (\code{remaining\_kwh}), we tested a \textbf{ratio target}:
+\[
+  \text{ratio} = \frac{\text{remaining kWh}}{\text{scale}}, \qquad
+  \text{scale} = \max(\text{to-date daily mean},\ 0.5) \times \text{days remaining}.
+\]
+A ratio of 1 means the run-rate is exactly right, so the model only has to learn the correction to it. The 0.5
+kWh/day floor (415 rows) stops near-empty homes from producing huge ratios. The model is trained with an
+absolute-error loss weighted by the scale, which makes the loss exactly the absolute error in kWh, and so in
+pounds. Four relative features follow the same idea:
+\begin{itemize}
+  \item the last 7 days against the to-date mean;
+  \item last month against the floored run-rate;
+  \item the 3-month mean against the floored run-rate;
+  \item same month last year against the floored run-rate.
+\end{itemize}
+
+\subsection{Prediction intervals}
+Three split-conformal methods~\cite{lei2018conformal} build a 90\% interval around the gradient boosting forecast,
+each calibrated separately for each $d$:
+\begin{itemize}
+  \item \textbf{absolute}: forecast $\pm$ a fixed amount in pounds;
+  \item \textbf{scaled}: forecast $\pm$ a multiple of the scale, so the width grows with usage and days left;
+  \item \textbf{CQR} (conformalized quantile regression~\cite{romano2019cqr}): two extra gradient boosting models
+  predict the 5th and 95th percentiles, then a conformal correction adjusts them.
+\end{itemize}
+Calibration uses out-of-fold errors, so each error comes from a model that never saw that month. No interval
+falls below the bill already on the meter.
+
+% =============================================================================
+\section{Evaluation Metrics}
+\label{sec:metrics}
+
+All point metrics are computed on the month-end bill in pounds:
+\begin{itemize}
+  \item \textbf{MAE}, the main metric: the household's typical error in pounds;
+  \item \textbf{RMSE}, which penalises large misses;
+  \item \textbf{MdAPE}, the median absolute percentage error, which is scale-free;
+  \item \textbf{bias}, the mean of forecast minus actual, where negative means under-forecasting.
+\end{itemize}
+Intervals are judged by \textbf{coverage} (target 90\%) and mean \textbf{width}. Coverage is checked overall and
+within groups: by $d$, by month, and by household size (terciles of the run-rate bill). This matters because an
+interval can hit 90\% on average while failing large households. Alerts are scored as a classification:
+\textbf{precision} (share of alerts that were right), \textbf{recall} (share of real overruns that got an alert)
+and \textbf{F1}. Whether the gap to the run-rate is real is tested with a household-block bootstrap (1,000
+resamples of whole households), which keeps each household's months and $d$ values together.
+
+% =============================================================================
+\section{Model Comparison and Optimization}
+\label{sec:validation}
+
+\subsection{Benchmarks and default models}
+Table~\ref{tab:cand} shows mean validation results across the three folds. The run-rate (\pounds 3.43) is far
+ahead of the history-only benchmarks. Last month (\pounds 6.83), same month last year (\pounds 8.85, available on
+45\% of rows) and the chain (\pounds 7.27) all predict the whole month and ignore the $d$ days already on the
+meter. On the same rows the run-rate scores about \pounds 3.43, so their losses are not caused by which rows they
+cover.
+
+With default settings, none of the four candidates beat the run-rate. For gradient boosting:
+\begin{itemize}
+  \item the absolute-error loss beats the squared loss (\pounds 3.49 vs 3.61), because the squared loss chases a
+  few very large months;
+  \item the ratio target matches the raw target on MAE and has the lowest RMSE (7.51), so it was kept.
+\end{itemize}
+
+\begin{table}[!ht]
+  \centering
+  \caption{Mean validation results across the three folds (\pounds), default hyperparameters.}
+  \label{tab:cand}
+  \small
+  \begin{tabularx}{\linewidth}{L r r r r}
+    \tableheadrow
+    \colhead{Model} & \colhead{MAE} & \colhead{RMSE} & \colhead{MdAPE \%} & \colhead{Bias} \\
+    \tableheadend
+    Run-rate benchmark & 3.43 & 7.72 & 4.08 & $-0.18$ \\
+    Last month benchmark & 6.83 & 13.29 & 10.13 & 1.97 \\
+    Same month last year benchmark (45\% of rows) & 8.85 & 17.48 & 11.87 & $-1.30$ \\
+    Chain benchmark & 7.27 & 13.91 & 11.04 & 1.57 \\
+    \midrule
+    Ridge, raw kWh target & 3.81 & 7.69 & 6.26 & 0.17 \\
+    Gradient boosting, raw target, squared loss & 3.61 & 7.89 & 4.65 & $-0.44$ \\
+    Gradient boosting, raw target, absolute loss & 3.49 & 7.81 & 4.42 & $-0.36$ \\
+    Gradient boosting, ratio target, absolute loss & 3.49 & 7.51 & 4.43 & $-0.62$ \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+\subsection{Feature selection}
+\label{sec:features}
+Features were tested in related groups, because related features stand in for each other, so dropping one at a
+time understates their value. A group is dropped if removing it lowers the mean validation MAE by more than
+\pounds 0.05 (Table~\ref{tab:ablation}).
+
+\begin{table}[!ht]
+  \centering
+  \caption{Feature-group ablation, gradient boosting with the ratio target. Change is mean MAE versus the full
+  feature set (negative means dropping the group helps).}
+  \label{tab:ablation}
+  \small
+  \begin{tabularx}{\linewidth}{L r r r r r}
+    \tableheadrow
+    \colhead{Group dropped} & \colhead{Fold 1} & \colhead{Fold 2} & \colhead{Fold 3} & \colhead{Mean} &
+    \colhead{Change} \\
+    \tableheadend
+    None (all features) & 4.473 & 3.412 & 2.463 & 3.449 & 0.000 \\
+    Month of year (sin/cos) & 3.849 & 3.576 & 2.511 & 3.312 & $-0.137$ \\
+    Temperature to date & 4.511 & 3.393 & 2.446 & 3.450 & 0.001 \\
+    Earlier-month lags & 4.377 & 3.368 & 2.465 & 3.404 & $-0.046$ \\
+    Relative features & 4.524 & 3.424 & 2.514 & 3.487 & 0.038 \\
+    ACORN group & 4.478 & 3.394 & 2.462 & 3.445 & $-0.005$ \\
+    Rest-of-month calendar & 4.498 & 3.790 & 2.464 & 3.584 & 0.135 \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+Only the month-of-year pair was dropped. Removing it cuts fold~1 MAE from 4.47 to 3.85. With one or two years of
+history, the model sees each calendar month only once or twice, so it learns that year's weather, not a seasonal
+pattern. Nineteen features remain.
+
+Permutation importance on fold~3 (20,000 sampled rows) confirms where the signal is: the relative features.
+Shuffling a feature raises the bill MAE by:
+\begin{itemize}
+  \item last month against the run-rate: \pounds 0.24;
+  \item the last 7 days against the to-date mean: \pounds 0.15;
+  \item same month last year against the run-rate: \pounds 0.07;
+  \item the 3-month mean against the run-rate: \pounds 0.05;
+  \item each raw size feature: at most \pounds 0.013.
+\end{itemize}
+The raw size features matter little once the ratio target has removed household size.
+% CHECK: temperature and weekend days remaining have slightly negative importance (-0.009); kept because the
+% group test showed changes under the 0.05 rule.
+
+\subsection{Hyperparameter tuning}
+\paragraph{Ridge} The penalty $\alpha \in \{0.1, 1, 10, 100, 1000\}$ was tuned. The best is $\alpha = 10$ (mean
+MAE \pounds 3.675). $\alpha = 100$ is nearly identical, and $\alpha = 1000$ is worse (\pounds 3.797).
+
+\paragraph{Gradient boosting} A grid of eight configurations was tested:
+\begin{itemize}
+  \item learning rate $\{0.03, 0.1\}$;
+  \item leaves per tree $\{7, 31\}$;
+  \item minimum rows per leaf $\{200, 2000\}$;
+  \item 300 iterations in every case.
+\end{itemize}
+The best is learning rate 0.03, 31 leaves and 200 rows per leaf (mean MAE \pounds 3.271, RMSE 7.30). The top five
+configurations are within \pounds 0.03 of each other, so the result does not hinge on the exact setting. Tuning
+and feature selection together cut gradient boosting's mean MAE from \pounds 3.49 to \pounds 3.27.
+
+\subsection{Tuned models by fold}
+After tuning, gradient boosting beats the run-rate in \emph{every} fold. Ridge loses to the run-rate in every fold,
+so it is kept only as a reference (Table~\ref{tab:folds}).
+
+\begin{table}[!ht]
+  \centering
+  \caption{Validation MAE (\pounds) of the tuned models by fold.}
+  \label{tab:folds}
+  \small
+  \begin{tabularx}{0.7\linewidth}{L r r r r}
+    \tableheadrow
+    \colhead{Model} & \colhead{Fold 1} & \colhead{Fold 2} & \colhead{Fold 3} & \colhead{Mean} \\
+    \tableheadend
+    Run-rate & 3.928 & 3.646 & 2.702 & 3.425 \\
+    Ridge ($\alpha = 10$) & 4.259 & 4.055 & 2.711 & 3.675 \\
+    Gradient boosting (tuned) & \textbf{3.783} & \textbf{3.544} & \textbf{2.488} & \textbf{3.271} \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+\subsection{Pooled versus per-household}
+The per-household model gets \emph{better} the less it trusts the household (Figure~\ref{fig:pooled}):
+\begin{itemize}
+  \item at $k = 0$ (full trust) the mean MAE is \pounds 3.92;
+  \item at $k = 128$ it is \pounds 3.43, which is simply the run-rate.
+\end{itemize}
+A household's past ``rest of month versus first $d$ days'' correction does not carry over to the next month.
+Adding this household history to the pooled model as features also makes it slightly worse (\pounds 3.32 vs 3.27).
+\textbf{The pooled model wins.} The pattern it learns (households running above their usual level tend to keep
+running above it) is shared across households, and 20 months per household is too few to learn it separately.
+
+\begin{figure}[!ht]
+  \centering
+  \includegraphics[width=0.75\linewidth]{p4_pooled_vs_household.png}
+  \caption{Mean validation MAE: per-household models with shrinkage $k$, pooled gradient boosting with and
+  without household history features, and the run-rate.}
+  \label{fig:pooled}
+\end{figure}
+
+\subsection{Choosing the interval method}
+The method was chosen on fold~3 using intervals calibrated on folds~1--2. The rule: pick the narrowest method that
+covers at least 87\% in every group (Table~\ref{tab:ivfold3}).
+\begin{itemize}
+  \item \textbf{Absolute} over-covers overall (94.8\%) but falls to 88.7\% for large households, because a fixed
+  width is too wide for small bills and too narrow for large ones.
+  \item \textbf{Scaled} fixes large households but under-covers small ones (87.4\%).
+  \item \textbf{CQR} stays between 88\% and 92\% in every group and is the narrowest, so it was chosen.
+\end{itemize}
+
+\begin{table}[!ht]
+  \centering
+  \caption{90\% interval methods on fold 3 (calibrated on folds 1--2).}
+  \label{tab:ivfold3}
+  \small
+  \begin{tabularx}{0.8\linewidth}{L r r r}
+    \tableheadrow
+    \colhead{Method} & \colhead{Coverage} & \colhead{Worst group} & \colhead{Mean width (\pounds)} \\
+    \tableheadend
+    Absolute & 94.8\% & 88.7\% & 16.55 \\
+    Scaled & 91.0\% & 87.4\% & 12.72 \\
+    CQR & 90.5\% & 88.3\% & \textbf{10.54} \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+% =============================================================================
+\section{Final Test Results}
+\label{sec:test}
+
+The tuned models were refitted on all months up to September 2013 and scored once on October 2013 to January 2014
+(48,321 rows from 4,118 households).
+
+\subsection{Point forecasts}
+Gradient boosting has the lowest error (Table~\ref{tab:test}):
+\begin{itemize}
+  \item MAE \pounds 3.60 against \pounds 3.80 for the run-rate, about 5\% lower;
+  \item MdAPE 4.2\%;
+  \item the household-block bootstrap puts the MAE difference at $-$\pounds 0.198 (95\% CI $-0.234$ to $-0.157$),
+  so the gain is real.
+\end{itemize}
+By forecast day (Table~\ref{tab:testd} and Figure~\ref{fig:testerr}), the gain is largest at $d = 7$, where the
+run-rate has least to go on, and clear at $d = 21$. At $d = 14$ the model and the run-rate are
+\textbf{indistinguishable}. Ridge is no better than the run-rate overall.
+
+\begin{table}[!ht]
+  \centering
+  \caption{Test results, October 2013 to January 2014 (\pounds).}
+  \label{tab:test}
+  \small
+  \begin{tabularx}{\linewidth}{L r r r r r}
+    \tableheadrow
+    \colhead{Model} & \colhead{Available} & \colhead{MAE} & \colhead{RMSE} & \colhead{MdAPE \%} & \colhead{Bias} \\
+    \tableheadend
+    Run-rate & 100\% & 3.80 & 8.60 & 4.21 & $-0.78$ \\
+    Last month & 99.6\% & 7.21 & 14.84 & 9.29 & $-3.56$ \\
+    Same month last year & 96.7\% & 9.84 & 21.53 & 12.35 & 2.33 \\
+    Chain & 100\% & 9.72 & 21.29 & 12.25 & 2.12 \\
+    Ridge & 100\% & 3.83 & 8.18 & 4.97 & $-1.43$ \\
+    Gradient boosting & 100\% & \textbf{3.60} & \textbf{8.06} & 4.24 & $-1.28$ \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+\begin{table}[!ht]
+  \centering
+  \caption{Test MAE by forecast day (\pounds) and the bootstrap 95\% CI for gradient boosting minus run-rate.}
+  \label{tab:testd}
+  \small
+  \begin{tabularx}{\linewidth}{L r r r Y{1}}
+    \tableheadrow
+    \colhead{$d$} & \colhead{Run-rate} & \colhead{Ridge} & \colhead{Gradient boosting} &
+    \colhead{Difference (95\% CI)} \\
+    \tableheadend
+    7 & 5.534 & 5.329 & \textbf{5.083} & $-0.451$ ($-0.516$ to $-0.379$) \\
+    14 & 3.609 & 3.633 & \textbf{3.594} & $-0.015$ ($-0.053$ to $+0.027$) \\
+    21 & 2.248 & 2.516 & \textbf{2.120} & $-0.128$ ($-0.155$ to $-0.101$) \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+\begin{figure}[!ht]
+  \centering
+  \includegraphics[width=\linewidth]{p4_test_error.png}
+  \caption{Test MAE by forecast day (left) and mean bias by test month (right) for the run-rate, Ridge and gradient
+  boosting.}
+  \label{fig:testerr}
+\end{figure}
+
+\paragraph{Bias} Every model under-forecasts in October and November 2013. Gradient boosting's bias is
+$-$\pounds 1.63 and $-$\pounds 2.78 in those months, because usage rises through the month as days get shorter and
+colder. Gradient boosting is more biased overall than the run-rate ($-$\pounds 1.28 vs $-$\pounds 0.78). Its
+absolute-error loss targets the \emph{median} remaining usage, which is below the mean when a few households
+spike. This trade-off gives a lower typical error at the cost of a small systematic under-forecast.
+
+\subsection{Prediction intervals}
+Calibrated on the out-of-fold errors of all three folds (January to September 2013, including winter months), the
+CQR intervals cover \textbf{88.9\%} of test bills (target 90\%), with a mean width of \pounds 14.44
+(Figure~\ref{fig:cov}). The absolute method is wider (\pounds 14.83) and covers less (88.1\%). It covers only
+74.3\% of large households, where CQR covers 87.1\%. CQR's weakest groups are November 2013 (86.3\%) and $d = 21$
+(86.6\%), the cases where every model under-forecasts.
+
+\begin{figure}[!ht]
+  \centering
+  \includegraphics[width=\linewidth]{p4_interval_coverage.png}
+  \caption{Test coverage of the three 90\% interval methods by forecast day, month and household size (left),
+  and mean width (right).}
+  \label{fig:cov}
+\end{figure}
+
+% =============================================================================
+\section{Alert Decision Layer}
+\label{sec:alerts}
+
+\textbf{Rule:} on day $d$, alert the household if the projected bill exceeds its baseline by more than $X$.
+\textbf{Truth:} the actual bill exceeded the baseline by more than $X$. Three choices were compared, each made on
+fold~3 and reported on the test months.
+
+\paragraph{Baseline}
+\begin{itemize}
+  \item \textbf{Trailing 3-month mean}: labels 35.2\% of test bills as overruns, against 14--15\% for the other two
+  baselines. In autumn and winter it compares each month with cheaper months, so it flags the normal seasonal rise.
+  \item \textbf{Same month last year}: the fairest across seasons, but missing for 18\% of fold~3 rows (households
+  less than a year old).
+  \item \textbf{Chosen:} same month last year where it exists, otherwise the trailing 3-month mean. It is
+  available for 99.8\% of rows.
+\end{itemize}
+
+\paragraph{Forecast day} Alert quality rises with $d$: test F1 for the model rule at $X = 20\%$ is 0.67, 0.77 and
+0.86 for $d = 7$, 14 and 21. But at $d = 21$ only about a week is left to change behaviour, and at $d = 7$ the
+model rule misses 43\% of overruns. \textbf{$d = 14$ is chosen}: half the month is left to act, with F1 near 0.8.
+
+\paragraph{Threshold $X$} $X$ is the household's tolerance, not something to optimise, and alert quality barely
+changes between 10\% and 30\% (Figure~\ref{fig:alerts}). The default is \textbf{20\%}.
+
+\paragraph{Alert rule} Three triggers were compared (Table~\ref{tab:alerts}):
+\begin{itemize}
+  \item the run-rate bill;
+  \item the gradient boosting forecast;
+  \item the lower bound of the 90\% interval.
+\end{itemize}
+On fold~3 the run-rate rule has a slightly higher F1 than the model rule (0.785 vs 0.778), so it is chosen. On the
+test months it flags 13.4\% of household-months, which equals the true overrun rate, with 80\% precision and 80\%
+recall. The model rule trades recall for precision (85.5\% / 70.6\%), because its downward bias makes it alert less
+often. The lower-bound rule is almost never wrong (98.4\% precision) but catches less than a third of overruns, so
+it suits a ``near-certain overrun'' message rather than the main alert.
+
+\begin{table}[!ht]
+  \centering
+  \caption{Alert rules at $d = 14$, $X = 20\%$, baseline: same month last year, else trailing 3-month mean.}
+  \label{tab:alerts}
+  \small
+  \begin{tabularx}{\linewidth}{L r r r r r}
+    \tableheadrow
+    \colhead{Rule} & \colhead{Fold 3 F1} & \colhead{Test alert \%} & \colhead{Test precision} &
+    \colhead{Test recall} & \colhead{Test F1} \\
+    \tableheadend
+    Run-rate (chosen) & \textbf{0.785} & 13.4 & 0.797 & \textbf{0.797} & \textbf{0.797} \\
+    Model point forecast & 0.778 & 11.1 & 0.855 & 0.706 & 0.774 \\
+    Model interval lower bound & 0.415 & 4.3 & \textbf{0.984} & 0.313 & 0.475 \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+\begin{figure}[!ht]
+  \centering
+  \includegraphics[width=\linewidth]{p4_alerts.png}
+  \caption{Test precision and recall of the three alert rules against the threshold $X$, at $d = 14$.}
+  \label{fig:alerts}
+\end{figure}
+
+% =============================================================================
+\section{Final Approach and Justification}
+\label{sec:final}
+
+\begin{enumerate}
+  \item \textbf{Forecast:} pooled histogram gradient boosting on the ratio target, trained with an absolute-error
+  loss.
+  \begin{itemize}
+    \item \emph{Settings:} learning rate 0.03, 31 leaves, at least 200 rows per leaf, 300 iterations, 19 features.
+    \item \emph{Why:} it was the only model to beat the run-rate in every validation fold, and it does so on the
+    test months, by a statistically clear margin.
+    \item \emph{What made the gain:} predicting the correction to the run-rate, plus features comparing the month
+    with the household's own recent level. Model complexity contributed little.
+  \end{itemize}
+  \item \textbf{Uncertainty:} CQR 90\% intervals, chosen because they keep coverage near 90\% across forecast days,
+  months and household sizes while being the narrowest.
+  \item \textbf{Alert:} $d = 14$, $X = 20\%$ by default, baseline same month last year else trailing 3-month mean,
+  triggered by the run-rate threshold. The model's forecast and interval are shown inside the alert message (for
+  example, ``projected \pounds 62, likely between \pounds 55 and \pounds 70''). For the yes/no decision a simple
+  threshold is as good as the model. The model's value is a more accurate number with honest uncertainty.
+\end{enumerate}
+
+The claim is deliberately modest. The run-rate is a strong benchmark, and gradient boosting improves on it by
+about 5\% overall. At the chosen $d = 14$ the point forecast is no better than the run-rate. At that day the
+model's contribution is the calibrated interval, not a lower error.
+% CHECK: the team may prefer d = 21 if accuracy matters more than lead time; all numbers for d = 21 are in the
+% notebook (section 9).
+
+% =============================================================================
+\section{Limitations}
+\label{sec:limits}
+
+\begin{itemize}
+  \item \textbf{Bill proxy.} kWh $\times$ 14.228~p/kWh, with no standing charge. This is not a real invoice.
+  \item \textbf{Std households only.} Time-of-use households remain the stretch goal.
+  \item \textbf{Complete months only.} Phase~2 kept only complete household-months, but a live system would not
+  know in advance that a month will be complete.
+  \item \textbf{Hardest-season test window.} The test months are four autumn and winter months, when usage rises
+  and every model under-forecasts. Errors in spring and summer are expected to be lower, as folds~2 and~3 suggest.
+  \item \textbf{About two years of history.} This is too little to learn seasonality reliably, and same-month-last-
+  year lags exist only from 2013.
+  \item \textbf{Conformal guarantee.} It assumes past errors resemble future ones (exchangeability), which seasonal
+  data does not strictly satisfy~\cite{hyndman2021fpp3}. Coverage was therefore checked empirically, and an
+  unusual month such as a cold snap can still break it.
+\end{itemize}
+
+% =============================================================================
+\section{Source Code and Reproducibility}
+\label{sec:code}
+
+All modelling code is in \code{notebooks/modeling.ipynb}, which passes Restart \& Run All in about ten minutes:
+\begin{itemize}
+  \item \emph{Input:} it reads \code{data/processed/features\_\allowbreak day\_d.parquet} with DuckDB.
+  \item \emph{Configuration:} every path, split date, grid and threshold is set in its first cell.
+  \item \emph{Random seed:} fixed (42).
+  \item \emph{Outputs:} the test forecasts, intervals and alerts (\code{predictions\_test.parquet} in
+  \code{data/processed/}) and the figures (\code{p4\_*.png} in \code{reports/figures/}).
+\end{itemize}
+A final cell runs nine checks and stops the notebook if any fails:
+\begin{itemize}
+  \item no training or calibration row from the test months;
+  \item fold training windows end before their validation windows;
+  \item every test row has a forecast and an interval;
+  \item no lower bound lies above its upper bound;
+  \item no forecast falls below the bill already on the meter;
+  \item the saved rows match the test set.
+\end{itemize}
+% CHECK: add the repository link if the course asks for it.
+
+\printbibliography[title={References}]
+
+\end{document}
