@@ -1,7 +1,7 @@
 [project]
 name = "smart-meter-analytics"
 version = "0.1.0"
-description = "Add your description here"
+description = "Month-end electricity bill forecasting from London smart meter data (UNB Data Analytics term project)"
 readme = "README.md"
 authors = [
     { name = "AkinbobolaAkin", email = "akinbobola71@gmail.com" }

@@ -1,6 +1,6 @@
 # Phase 3 Checklist: Changes to Realign with Phase 1
 
-The first Phase 3 pass (`../notebooks/data_exploration.ipynb`, `../reports/phase3/phase3_report.tex`) framed
+The first Phase 3 pass (`data_exploration.ipynb`, `reports/phase3/phase3_report.tex`, both removed in the 2026-11-24 cleanup and recoverable from git history at `b7815bd`) framed
 the task as forecasting **next month's** bill from previous months. We are keeping the Phase 1 framing:
 
 > On day `d` of a billing month, project that month's end-of-month bill for each household, with a
