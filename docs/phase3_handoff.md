@@ -1,6 +1,7 @@
 # Phase 3 Handoff
 
-Written 2026-11-10 to move the Phase 3 rework into a fresh session. Read this, `CLAUDE.md`,
+Written 2026-11-10 to move the Phase 3 rework into a fresh session. Historical: the teammate files listed below
+were (removed in the 2026-11-24 cleanup; recoverable from git history at `b7815bd`). Read this, `CLAUDE.md`,
 `reports/CLAUDE.md` and `docs/phase3_checklist.md` before starting.
 
 ## The task

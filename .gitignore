@@ -242,3 +242,11 @@ reports/**/build/
 *.bcf
 *.run.xml
 **/CLAUDE.md
+
+# OS and editor clutter
+.DS_Store
+.idea/
+
+# LaTeX aux dir (latexmk $aux_dir) and rendered PDFs: build them locally, never commit
+reports/**/.aux/
+reports/**/*.pdf

@@ -1,6 +1,6 @@
 # Phase 4 Checklist: Modeling & Analysis
 
-Notebook: `../notebooks/modeling.ipynb` (new; the teammate's `modeling_analysis.ipynb` is left as written).
+Notebook: `../notebooks/modeling.ipynb` (replaces the teammate's first pass `modeling_analysis.ipynb`, removed in the 2026-11-24 cleanup and recoverable from git history at `b7815bd`).
 Rubric: `spec/phase4_details.pdf`. Framing unchanged from Phase 1: on day `d`, project the month-end bill
 (kWh x 14.228 p/kWh, a computed proxy) per standard-tariff household, with a 90% prediction interval, then alert
 if it exceeds the household's baseline by more than X.

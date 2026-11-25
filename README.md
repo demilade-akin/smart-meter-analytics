@@ -1,3 +1,44 @@
+# Smart Meter Bill Forecasting
+
+UNB Data Analytics (TME6014) term project, Fall 2026. Topic #24: power consumption forecasting using smart meter data.
+
+**Problem.** On day `d` of a billing month, project each household's month-end electricity bill with a 90%
+prediction interval, and alert the household if the projection exceeds its usual bill by more than X%. The bill is a
+**computed proxy** (kWh x 14.228 p/kWh, the published standard tariff, no standing charge), not a real invoice.
+
+**Data.** "Smart meters in London" (UK Power Networks, Low Carbon London trial; London Datastore / Kaggle, CC BY 4.0):
+half-hourly readings for 5,566 households, Nov 2011 to Feb 2014. Modelling covers standard-tariff households only.
+
+## Repository layout
+
+```
+data/{raw,interim,processed}/   gitignored, rebuilt by the notebooks (only data/raw/Tariffs.xlsx is committed)
+notebooks/
+  data_preparation.ipynb        Phase 2: raw CSVs -> cleaned daily and monthly tables
+  feature_engineering.ipynb     Phase 3: EDA and the day-d modelling dataset
+  modeling.ipynb                Phase 4: models, tuning, intervals, final test, alert layer
+src/smart_meter_analytics/      package (data/profile.py: Phase 1 data-quality profile)
+reports/
+  _template/                    shared LaTeX preamble
+  phase1/ ... phase4/           one main.tex + references.bib per phase
+  figures/                      figures written by the notebooks (p3_*, p4_*)
+  data_quality/                 Phase 1 profile report
+docs/                           course spec and rubrics (spec/), phase checklists
+```
+
+## Pipeline
+
+Run the notebooks in this order. Each writes Parquet that the next one reads.
+
+| Notebook | Reads | Writes |
+|---|---|---|
+| `data_preparation.ipynb` | raw CSVs (downloaded by `kagglehub` in the notebook), `Tariffs.xlsx` | `data/processed/daily.parquet`, `monthly.parquet`, `monthly_encoded.parquet` |
+| `feature_engineering.ipynb` | `daily.parquet`, `monthly.parquet` | `data/processed/features_day_d.parquet`, `reports/figures/p3_*.png` |
+| `modeling.ipynb` | `features_day_d.parquet` | `data/processed/predictions_test.parquet`, `reports/figures/p4_*.png` |
+
+Reports build with `latexmk -pdf -outdir=build main.tex` from each `reports/phaseN/` folder. Build output and PDFs are
+not committed.
+
 ## Getting Started
 
 ### 1. Install uv
@@ -14,7 +55,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 uv sync
 ```
 
-### 3. Run the data preparation notebook
+### 3. Run the notebooks (in the order listed under Pipeline)
 
 ```bash
 uv run jupyter lab
@@ -113,3 +154,28 @@ The main input for modelling is `data/processed/monthly.parquet`, with one row p
 | `data/processed/daily.parquet` | 3,239,805 | Household-days with usage, cost, household info, weather, holiday flag |
 | `data/processed/monthly.parquet` | 106,225 | Household-months with kWh and bill proxy |
 | `data/processed/monthly_encoded.parquet` | 106,225 | Monthly table plus one-hot columns |
+
+## EDA and feature engineering (Phase 3)
+
+`notebooks/feature_engineering.ipynb` explores the cleaned data and builds the day-`d` dataset
+`data/processed/features_day_d.parquet`: one row per standard-tariff household x month x `d`, with `d` in {7, 14, 21}
+(254,421 rows, 4,428 households). Every feature uses only what is known on day `d`: kWh so far, the last 7 days,
+earlier-month lags, rest-of-month calendar counts, temperature to date and ACORN group. The target is the kWh still
+to come. Report: `reports/phase3/main.tex`.
+
+## Modeling and analysis (Phase 4)
+
+`notebooks/modeling.ipynb` splits by month (three expanding validation folds in Jan to Sep 2013, test Oct 2013 to
+Jan 2014). It compares the run-rate, last-month and same-month-last-year benchmarks with Ridge and histogram gradient
+boosting. Headline results on the test months:
+
+- **Forecast:** pooled gradient boosting on a ratio-to-run-rate target, MAE GBP 3.60 per monthly bill vs GBP 3.80 for
+  the run-rate (household bootstrap 95% CI of the difference: -0.23 to -0.16). The gain is clear at `d` = 7 and 21,
+  not at `d` = 14.
+- **Pooled vs per-household:** pooled wins; per-household history adds nothing.
+- **Intervals:** conformalized quantile regression, 88.9% coverage of the 90% target, stable across `d`, month and
+  household size.
+- **Alerts:** `d` = 14, X = 20% by default, baseline = same month last year (else trailing 3-month mean), triggered by
+  the run-rate; 80% precision and 80% recall on test overruns.
+
+Report: `reports/phase4/main.tex`.
